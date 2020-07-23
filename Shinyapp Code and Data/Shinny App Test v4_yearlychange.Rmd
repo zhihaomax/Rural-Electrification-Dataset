@@ -1,0 +1,368 @@
+---
+title: "Shiny App Test v4"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+---
+title: "Shiny App Test v3 can select year"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyverse)
+
+alldata <- read.csv('./REA_ASR_3846_final.csv', encoding = "UTF-8")
+alldata$latitude <- jitter(alldata$latitude)
+alldata$longitude <- jitter(alldata$longitude)
+## First clean dataset
+wholedata<- alldata %>%
+  rename(year = X.U.FEFF.year,
+         Lat = latitude, 
+         Long = longitude,
+         EnergyConsump= kwh_per_cc1,
+         MilesEnergized= op_me) %>%
+  rename(farms = farms_40, 
+         farm_pop = farm_pop_40,
+         plf = plf_40,
+         landval = value_land_40,
+         totpop = totpop_40,
+         wholest = wholest_40,
+         dwell = dwell_40,
+         cropval = cropval_40,
+         dwelectr = dwelectr_40,
+         farm_electri = farm_electri_40,
+         hard_road = hard_road_40,
+         gravel_road = gravel_road_40,
+         electri_distri_line = electri_distri_line_40,
+         farmsize = farmsize_40,
+         val_livestock = val_livestock_39,
+         val_crop = val_crop_39,
+         percent_white = per_white_40) %>%
+  filter(!is.na(EnergyConsump), !is.na(min_stop_dist), !is.na(state), !is.na(county), !is.na(system), !is.na(MilesEnergized)) %>%
+  select(-state) %>%
+  rename(state= st_code) %>%
+  mutate(LnEnergy= log(EnergyConsump),
+         LnMile= log(MilesEnergized),
+         LnFarm= log(farms),
+         LnFarmpop= log(farm_pop),
+         LnElectrifarm= log(farm_electri),
+         Ratio_Croplivestock= val_crop/(val_crop+val_livestock),
+         InverseDist= 1/min_stop_dist,
+         AvgDcompB= (DCOMPB1938+DCOMPB1940+DCOMPB1942+DCOMPB1944+DCOMPB1946)/5,
+         AvgRcompB= (RCOMPB1938+RCOMPB1940+RCOMPB1942+RCOMPB1944+RCOMPB1946)/5)
+  
+## estiamte propensity score 
+wholedata$Treat <- ifelse(wholedata$min_stop_dist<=20, 1, 0)
+
+keeps <- c("year", "state", "county", "city", "system", "EnergyConsump", "LnEnergy","min_stop_dist","InverseDist", "Treat", "Lat", "Long","MilesEnergized", "LnMile","LnFarm","LnFarmpop", "LnElectrifarm","Ratio_Croplivestock", "percent_white", "dist_tolargecity", "AvgDcompB", "AvgRcompB")
+
+psdata <- wholedata[keeps]
+
+ps_model <- glm(Treat ~ Lat + LnMile + LnFarmpop + LnElectrifarm + Ratio_Croplivestock + percent_white + dist_tolargecity + AvgRcompB +factor(year), data = psdata, family = "binomial")
+
+#---Attach	the	predicted	propensity	score	to	the	data frame
+psdata$PropScore <- predict(ps_model, type = "response")
+
+
+```
+
+```{r}
+## Make dataset shiny compatible
+library(leaflet)
+library(RColorBrewer)
+library(scales)
+library(lattice)
+library(dplyr)
+library(shiny)
+
+server <- shinyServer(function(input, output, session) {
+  
+  ## Interactive Map ###########################################
+  # Filter the dataset to calculate change of energy consumption
+  readata <- reactive({
+              psdata %>%
+              select(system, year, Lat, Long, state, county, city,  EnergyConsump, min_stop_dist, PropScore, MilesEnergized) %>%
+              filter(year==input$miny|year==input$maxy) %>%
+              arrange(system, year) %>%
+              group_by(system) %>%
+              mutate(min_dist= min(min_stop_dist)) %>%
+              mutate(energy_growth = 100*c(NA,diff(EnergyConsump))/lag(EnergyConsump, 1)) %>%
+              mutate(mile_growth = 100*c(NA,diff(MilesEnergized))/lag(MilesEnergized, 1)) %>%
+              select(-min_stop_dist) %>%
+              pivot_wider(names_from = year, values_from =c(EnergyConsump, MilesEnergized)) %>%
+              fill(starts_with("EnergyConsump")) %>%
+              fill(starts_with("MilesEnergized")) %>%
+              filter(!is.na(energy_growth), energy_growth<=200) %>%
+              mutate(LnDist= log(min_dist)) %>%
+              mutate(Score= round(PropScore,3))
+  })
+  
+  # Create the base map
+  output$map <- renderLeaflet({
+    leaflet() %>%
+      addTiles(
+        urlTemplate = "//{s}.tiles.mapbox.com/v3/jcheng.map-5ebohr46/{z}/{x}/{y}.png",
+        attribution = 'Maps by <a href="http://www.mapbox.com/">Mapbox</a>'
+      ) %>%
+      setView(lng = -93.85, lat = 37.45, zoom = 4)
+  })
+  
+  # A reactive expression that returns the set of systems that are
+  # in bounds right now
+  MapsInBounds <- reactive({
+    if (is.null(input$map_bounds))
+      return(readata()[FALSE,])
+    bounds <- input$map_bounds
+    latRng <- range(bounds$north, bounds$south)
+    lngRng <- range(bounds$east, bounds$west)
+    
+    subset(readata(),
+           Lat >= latRng[1] & Lat <= latRng[2] &
+             Long >= lngRng[1] & Long <= lngRng[2])
+  })
+  
+  # Precalculate the breaks, min and max value, we'll need for the two histograms
+  observe({
+  Breaks <- hist(plot = FALSE, readata()$energy_growth, breaks = 20)$breaks
+  min_ec <- min(readata()$energy_growth)
+  max_ec <- max(readata()$energy_growth)
+  min_dist <- min(readata()$LnDist)
+  max_dist <- max(readata()$LnDist)
+  
+  output$histEnergy <- renderPlot({
+    # If no zipcodes are in view, don't plot
+    if (nrow(MapsInBounds()) == 0)
+      return(NULL)
+
+  hist(MapsInBounds()$energy_growth,
+      breaks = Breaks,
+      main = "Change of Energy Consumption (visible systems)",
+      xlab = "KWH (%)",
+      xlim = c(min_ec, max_ec),
+      col = '#00DD00',
+      border = 'white')
+  })
+  
+  output$scatterStopEnergy <- renderPlot({
+    # If no zipcodes are in view, don't plot
+    if (nrow(MapsInBounds()) == 0)
+      return(NULL)
+
+    print(xyplot(energy_growth ~ LnDist, data = MapsInBounds(), xlim = c(min_dist, max_dist), ylim = c(min_ec, max_ec), xlab = "Ln(Dist to Nearest Stop in Miles)", ylab= "KWH Change (%)"))
+      })
+  
+    })
+  
+  # This observer is responsible for maintaining the circles and legend,
+  # according to the variables the user has chosen to map to color and size.
+  session$onFlushed(once=TRUE, function() {
+    paintObs <- observe({
+    colorBy <- input$color
+    sizeBy <- input$size
+
+    if (colorBy == "Treat") {
+      # Color and palette are treated specially in the "treat" case, because
+      # the values are categorical instead of continuous.
+      colorData <- ifelse(readata()$min_dist<=input$threshold, "yes", "no")
+      pal <- colorFactor("viridis", colorData)
+    } else {
+      colorData <- readata()[[colorBy]]
+      pal <- colorBin("viridis", colorData, 5, pretty = FALSE)
+    }
+
+    radius <- readata()[[sizeBy]] / max(readata()[[sizeBy]]) * 30000
+    
+    observe({
+    leafletProxy("map", data = readata()) %>%
+      clearShapes() %>%
+      addCircles(~Long, ~Lat, radius=radius, layerId=~system,
+        stroke=FALSE, fillOpacity=0.5, fillColor=pal(colorData)) %>%
+      addLegend("bottomleft", pal=pal, values=colorData, title=colorBy, layerId="colorLegend")
+      })
+    
+    })
+    
+  session$onSessionEnded(paintObs$suspend)
+  })
+  
+# Show a popup at the given location
+showBorrowerPopup <- function(system, lat, lng) {
+  observe({
+    selectedsys <- readata()[readata()$system == system,]
+    content <- as.character(tagList(
+      tags$h4("System:", as.character(selectedsys$system)),
+      tags$strong(HTML(sprintf("%s, %s %s",
+                               selectedsys$city, selectedsys$county, selectedsys$state
+      ))), tags$br(),
+      sprintf("Growth of Energy Consumption Per Customer: %s%%", as.integer(selectedsys$energy_growth)), tags$br(),
+      sprintf("Distance to Nearest Roadshow Stop: %s", as.integer(selectedsys$min_dist)), tags$br(),
+      sprintf("Propensity Score To Be Treated: %s", selectedsys$Score), tags$br(),
+      sprintf("Growth of Miles Energized: %s%%", as.integer(selectedsys$mile_growth))
+    ))
+    leafletProxy("map", data = readata()) %>% addPopups(lng, lat, content, layerId = system)
+  })
+}
+
+# When map is clicked, show a popup with city info
+clickObs <- observe({
+  leafletProxy("map", data = readata()) %>% clearPopups()
+  event <- input$map_shape_click
+  if (is.null(event))
+    return()
+  
+  isolate({
+    showBorrowerPopup (event$id, event$lat, event$lng)
+  })
+})
+
+## Data Explorer ###########################################
+  observe({
+    counties <- if (is.null(input$states)) character(0) else {
+      psdata %>% 
+        filter(state %in% input$states) %>%
+        `$`('county') %>%
+        unique() %>%
+        sort()
+    }
+    stillSelected <- isolate(input$counties[input$counties %in% counties])
+    updateSelectizeInput(session, "counties", choices = counties,
+      selected = stillSelected, server = TRUE)
+  })
+
+  observe({
+    systems <- if (is.null(input$states)) character(0) else {
+     psdata %>%
+        filter(state %in% input$states,
+          is.null(input$counties) | county %in% input$counties) %>%
+        `$`('system') %>%
+        unique() %>%
+        sort()
+    }
+    stillSelected <- isolate(input$systems[input$systems %in% systems])
+    updateSelectizeInput(session, "systems", choices = systems,
+      selected = stillSelected, server = TRUE)
+  })
+
+  output$systable <- DT::renderDataTable({
+    df <- readata() %>%
+      filter(
+        min_dist >= input$Dist[1]& min_dist<= input$Dist[2],
+        is.null(input$states) | state %in% input$states,
+        is.null(input$counties) | county %in% input$counties,
+        is.null(input$systems) | system %in% input$systems
+      ) %>%
+      mutate(Dist_to_RoadshowStop= round(min_dist,2),
+             Growth_Energy_Consumption= round(energy_growth,2),
+             Growth_Mile_Energized= round(mile_growth,2)) %>%
+      rename(Propensity_Score= Score) %>%
+      select(system:city,Dist_to_RoadshowStop:Growth_Mile_Energized, starts_with("EnergyConsump"), starts_with("MilesEnergized"), Propensity_Score)
+
+    DT::datatable(df, escape = FALSE)
+  })
+})
+
+```
+
+
+```{r}
+## UI Setup
+library(leaflet)
+library(shiny)
+
+years_start <- c("1938", "1939","1940", "1941","1942","1943","1944","1945")
+years_end <- c("1939","1940", "1941","1942","1943","1944","1945","1946")
+
+vars <- c(
+  "Is Treated Borrower?" = "Treat",
+  "Distance to Nearest Roadshow Stop " = "min_dist",
+  "Growth of Energy Consumption" = "energy_growth",
+  "Growth of Miles Energized" = "mile_growth"
+)
+
+# Choices for drop-downs
+ui <- shinyUI(navbarPage("REA Data", id="nav",
+
+  tabPanel("Interactive map",
+    div(class="outer",
+
+      # If not using custom CSS, set height of leafletOutput to a number instead of percent
+    leafletOutput("map", width="768", height="480"),
+
+      # Shiny versions prior to 0.11 should use class = "modal" instead.
+      absolutePanel(id = "controls", class = "panel panel-default", fixed = TRUE, draggable = TRUE, top = 60, left = "auto", right = 20, bottom = "auto", width = 330, height = "auto",
+
+        h2("READata explorer"),
+        
+        selectInput("miny", "From", years_start, selected="1941"),
+        selectInput("maxy", "To", years_end, selected="1946"),
+        
+        selectInput("color", "Color", vars),
+        selectInput("size", "Size", vars, selected = "energy_growth"),
+        conditionalPanel("input.color == 'Treat'",
+          # Only prompt for threshold when coloring by superzip
+        numericInput("threshold", "Distance threshold (miles)", 20)),
+        
+        plotOutput("histEnergy", height = 200),
+        plotOutput("scatterStopEnergy", height = 250)
+      ),
+      tags$div(id="cite",
+        'Note:', '(1) propensity score is estimated using 20 miles as threshold;', tags$br(), '(2) energy consumption data in 1938-1940 use different measure with later years.', tags$em('Please refer to README file for details.')
+      )
+    )
+  ),
+  
+    tabPanel("Data explorer",
+    fluidRow(
+      column(3,
+        selectInput("states", "States", c("All states"="", structure(state.abb, names=state.name)), multiple=TRUE)
+      ),
+      column(3,
+        conditionalPanel("input.states",
+          selectInput("counties", "Counties", c("All counties"=""), multiple=TRUE)
+        )
+      ),
+      column(3,
+        conditionalPanel("input.states",
+          selectInput("systems", "Systems", c("All systems"=""), multiple=TRUE)
+        )
+      )
+    ),
+    hr(),
+    fluidRow(
+    column(10,
+      sliderInput("Dist", label = h4("Distance to Nearest Stop"), min = 0, 
+        max = 800, value = c(0, 40))
+      )
+    ),
+    hr(),
+    DT::dataTableOutput("systable")
+  ),
+  
+  tabPanel("README",
+          tags$h2("README before using the app"), tags$br(), 
+          tags$h4("This is achivement of 2020 Duke University Data+ Program."), tags$br(), 
+          tags$h5('Our project name is "Taking electrification on the road: Exploring the impact of the Electric Farm Equipment roadshow". For the ouline of our project, please visit:'),
+          tags$a(href="https://bigdata.duke.edu/projects/taking-electrification-road-exploring-impact-electric-farm-equipment-roadshow", "Here"),
+          tags$h5("Thanks for guidance of project leader Victoria Plutshack, Jonathon Free, Robert Fetter. Also, thanks for project manager William Neiver and David Buch. Work is jointly accomplished by Franco Picone, Tri Truong, and Zhihao Han."),
+          tags$h5("We collect the data by scraping annual statistical report published by rural electrification administration (REA) from 1941 to 1946. This report provides detailed data about allotment, construction, operation and loan payment for each REA borrower. Full dataset, detailed description, and shinyapp code can be downloaded at:"),
+          tags$a(href="https://github.com/zhihaomax/Rural-Electrification-Dataset", "Here")
+          
+  ),
+
+  conditionalPanel("false", icon("crosshair"))
+))
+```
+
+```{r}
+# Create Shiny app ----
+shinyApp(ui = ui, server = server)
+```
