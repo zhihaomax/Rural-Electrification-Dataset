@@ -16,14 +16,18 @@ alldata$latitude <- jitter(alldata$latitude)
 alldata$longitude <- jitter(alldata$longitude)
 ## we test this code using 1943 data
 wholedata<- alldata %>%
-  rename(year = X.U.FEFF.Year,
+  rename(year = X.U.FEFF.year,
          Lat = latitude, 
          Long = longitude,
-         EnergyConsump= kwh_per_cc1) %>%
-  filter(!is.na(EnergyConsump), !is.na(min_stop_dist), !is.na(allo_all), !is.na(re_opm), !is.na(state), !is.na(county), !is.na(system), !is.na(op_me)) %>%
+         EnergyConsump= kwh_per_cc1,
+         MilesEnergized= op_me) %>%
+  filter(!is.na(EnergyConsump), !is.na(min_stop_dist), !is.na(allo_all), !is.na(re_opm), !is.na(state), !is.na(county), !is.na(system), !is.na(MilesEnergized)) %>%
   select(year:system, Lat:allo_all, op_kwh_p, op_kwh_b, op_ccn,    re_opm, re_cpp) %>%
   select(-state) %>%
-  rename(state= st_code) 
+  rename(state= st_code) %>%
+  mutate(LnEnergy= log(EnergyConsump),
+         LnMile= log(MilesEnergized),
+         LnDist= log(min_stop_dist))
 
 wholedata$Treat <- ifelse(wholedata$min_stop_dist<=20, 1, 0)
 
@@ -78,8 +82,10 @@ server <- shinyServer(function(input, output, session) {
   Breaks <- hist(plot = FALSE, readata()$EnergyConsump, breaks = 20)$breaks
   min_ec <- min(readata()$EnergyConsump)
   max_ec <- max(readata()$EnergyConsump)
-  min_dist <- min(readata()$min_stop_dist)
-  max_dist <- max(readata()$min_stop_dist)
+  min_ec2 <- min(readata()$LnEnergy)
+  max_ec2 <- max(readata()$LnEnergy)
+  min_dist <- min(readata()$LnDist)
+  max_dist <- max(readata()$LnDist)
 
   output$histEnergy <- renderPlot({
     # If no zipcodes are in view, don't plot
@@ -100,7 +106,7 @@ server <- shinyServer(function(input, output, session) {
     if (nrow(MapsInBounds()) == 0)
       return(NULL)
 
-    print(xyplot(EnergyConsump ~ min_stop_dist, data = MapsInBounds(), xlim = c(min_dist, max_dist), ylim = c(min_ec, max_ec), xlab = "Dist to Nearest Stop (Mile)", ylab= "KWH"))
+    print(xyplot(LnEnergy ~ LnDist, data = MapsInBounds(), xlim = c(min_dist, max_dist), ylim = c(min_ec2, max_ec2), xlab = "Ln(Dist to Nearest Stop (Mile))", ylab= "Ln(KWH)"))
     })
   
   })
@@ -116,10 +122,10 @@ server <- shinyServer(function(input, output, session) {
       # Color and palette are treated specially in the "treat" case, because
       # the values are categorical instead of continuous.
       colorData <- ifelse(readata()$min_stop_dist<=input$threshold, "yes", "no")
-      pal <- colorFactor("magma", colorData)
+      pal <- colorFactor("Dark2", colorData)
     } else {
       colorData <- readata()[[colorBy]]
-      pal <- colorBin("magma", colorData, 5, pretty = FALSE)
+      pal <- colorBin("Dark2", colorData, 5, pretty = FALSE)
     }
 
     radius <- readata()[[sizeBy]] / max(readata()[[sizeBy]]) * 30000
@@ -151,7 +157,7 @@ server <- shinyServer(function(input, output, session) {
       sprintf("Total Allotment: %s", dollar(selectedsys$allo_all)), tags$br(),
       sprintf("Consumers Served: %s", as.integer(selectedsys$op_ccn)), tags$br(),
       sprintf("Operation Revenue: %s", as.integer(selectedsys$re_opm)), tags$br(),
-      sprintf("Miles Energized: %s", as.integer(selectedsys$op_me))
+      sprintf("Miles Energized: %s", as.integer(selectedsys$MilesEnergized))
     ))
     leafletProxy("map", data = readata()) %>% addPopups(lng, lat, content, layerId = system)
     })
@@ -170,47 +176,6 @@ clickObs <- observe({
   })
 
 session$onSessionEnded(clickObs$suspend)
-
-## Data Explorer ###########################################
-  observe({
-    counties <- if (is.null(input$states)) character(0) else {
-      wholedata %>% 
-        filter(state %in% input$states) %>%
-        `$`('county') %>%
-        unique() %>%
-        sort()
-    }
-    stillSelected <- isolate(input$counties[input$counties %in% counties])
-    updateSelectizeInput(session, "counties", choices = counties,
-      selected = stillSelected, server = TRUE)
-  })
-
-  observe({
-    systems <- if (is.null(input$states)) character(0) else {
-     wholedata %>%
-        filter(state %in% input$states,
-          is.null(input$counties) | county %in% input$counties) %>%
-        `$`('system') %>%
-        unique() %>%
-        sort()
-    }
-    stillSelected <- isolate(input$systems[input$systems %in% systems])
-    updateSelectizeInput(session, "systems", choices = systems,
-      selected = stillSelected, server = TRUE)
-  })
-
-  output$systable <- DT::renderDataTable({
-    df <- wholedata %>%
-      filter(
-        year>=input$Y[1]&year<=input$Y[2],
-        min_stop_dist >= input$Dist[1]& min_stop_dist<= input$Dist[2],
-        is.null(input$states) | state %in% input$states,
-        is.null(input$counties) | county %in% input$counties,
-        is.null(input$systems) | system %in% input$systems
-      )
-
-    DT::datatable(df, escape = FALSE)
-  })
 
 })
 
@@ -259,40 +224,6 @@ ui <- shinyUI(navbarPage("REA Data", id="nav",
         
       ),
     )
-  ),
-  
-  tabPanel("Data explorer",
-    fluidRow(
-    column(2,
-      sliderInput("Y", label = h4("Data Year"), min = 1941, 
-        max = 1946, value = c(1942, 1944))
-      )
-    ),
-    hr(),
-    fluidRow(
-      column(3,
-        selectInput("states", "States", c("All states"="", structure(state.abb, names=state.name)), multiple=TRUE)
-      ),
-      column(3,
-        conditionalPanel("input.states",
-          selectInput("counties", "Counties", c("All counties"=""), multiple=TRUE)
-        )
-      ),
-      column(3,
-        conditionalPanel("input.states",
-          selectInput("systems", "Systems", c("All systems"=""), multiple=TRUE)
-        )
-      )
-    ),
-    hr(),
-    fluidRow(
-    column(10,
-      sliderInput("Dist", label = h4("Distance to Nearest Stop"), min = 0, 
-        max = 800, value = c(0, 40))
-      )
-    ),
-    hr(),
-    DT::dataTableOutput("systable")
   ),
 
   conditionalPanel("false", icon("crosshair"))
