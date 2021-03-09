@@ -129,7 +129,7 @@ compress
 save "/Volumes/Disk E/Data Plus/data/PSM/Data/pre_data", replace
 
 
-******* Note: the following code only includes the distance to Farm Equipment Tour stops
+******* Note: the following code only includes the distance to Farm Equipment Tour stops and take 30 miles as the threshold
 
 ****************************************************************************
 ************* Step 1: Generate Treat and START Variable ********************
@@ -184,10 +184,7 @@ gen after_lag= l.after
 gen after_diff= after-after_lag
 gen START= 0
 replace START= 1 if after_diff== 1 
-* !! note: some sites are treated since the start year of sample, whether we should drop these sites?
-replace START= 1 if after_lag==. & after==1
-drop after_lag after_diff
-// theoretically, we should drop the sites that are treated since entering the data
+* theoretically, we should drop the sites that are treated since entering the data since there is no change during sample periods (thus no DID effect)
 drop if sys_always_treat==1
 * check if each site has only one start year
 bys system_code: egen temp= total(START)
